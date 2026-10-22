@@ -1,0 +1,5 @@
+{
+  "SshHost": "my-server",
+  "ProxyPort": 7890,
+  "RemoteFolder": "/home/user/project"
+}
