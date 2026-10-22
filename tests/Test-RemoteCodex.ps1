@@ -28,6 +28,13 @@ public class MockEntry {
         }
         if (mode == "code-error") { Thread.Sleep(700); return 42; }
         if (mode == "ssh-drop") { Thread.Sleep(15000); return 0; }
+        if (mode == "user-stop") {
+            Thread.Sleep(700);
+            int position=Array.IndexOf(args,"--user-data-dir");
+            string runtime=Directory.GetParent(args[position+1]).FullName;
+            File.WriteAllText(Path.Combine(runtime,"stop.request"),"stop");
+            Thread.Sleep(15000); return 0;
+        }
         Thread.Sleep(1000);
         return 0;
     }
@@ -45,14 +52,14 @@ $listener.Start()
 $testPort = $listener.LocalEndpoint.Port
 try {
     Test-ProxyPort $testPort
-    foreach ($mode in @('window-close','ssh-drop','code-error')) {
+    foreach ($mode in @('window-close','gui-window-close','user-stop','ssh-drop','code-error')) {
         $env:CODEX_SWITCH_TEST_MODE = $mode
         $script:RuntimeRoot = Join-Path $testRoot $mode
         $script:ConfigFile = Join-Path $testRoot ($mode + '.json')
-        $cfg = [pscustomobject]@{ SshHost='Example'; ProxyPort=$testPort; RemoteFolder='/home/example/a b' }
+        $cfg = [pscustomobject]@{ SshHost='Example'; ProxyPort=$testPort; AutoDetectProxyPort=$false; RemoteFolder='/home/example/a b' }
         Write-JsonFile $script:ConfigFile $cfg
         $caught = $false
-        try { Start-CodexSession } catch {
+        try { Start-CodexSession -GuiMode:($mode -eq 'gui-window-close') } catch {
             if ($mode -ne 'code-error') { throw }
             Assert-Test ($_.Exception.Message -like '*42*') 'Unexpected code error.'
             $caught = $true
@@ -61,7 +68,9 @@ try {
         Assert-Test (-not (Test-Path -LiteralPath (Join-Path $script:RuntimeRoot 'session.json'))) 'State was not cleared.'
         $settings = Get-Content -LiteralPath (Join-Path $script:RuntimeRoot 'vscode-data\User\settings.json') -Raw -Encoding UTF8 | ConvertFrom-Json
         Assert-Test ($settings.'http.proxy' -eq '') 'Proxy setting was not reset.'
-        $workspaceText = Get-Content -LiteralPath (Join-Path $script:RuntimeRoot 'Remote-Codex.code-workspace') -Raw -Encoding UTF8
+        $workspaceFiles = @(Get-ChildItem -LiteralPath $script:RuntimeRoot -Filter 'Remote-Codex-*.code-workspace')
+        Assert-Test ($workspaceFiles.Count -eq 1) 'A distinct workspace was not created for this session.'
+        $workspaceText = Get-Content -LiteralPath $workspaceFiles[0].FullName -Raw -Encoding UTF8
         Assert-Test ($workspaceText.Contains('a%20b')) 'Remote URI path encoding failed.'
         Assert-Test ($workspaceText.Contains('"HTTP_PROXY"') -and $workspaceText.Contains('"http_proxy"')) 'Case-sensitive environment keys were lost.'
         Assert-Test ([IO.File]::ReadAllText($testSshSource) -eq $originalSsh) 'Original SSH config was changed.'
@@ -85,6 +94,10 @@ try {
         Assert-Test $rejected 'Invalid configuration was accepted.'
     }
     Write-Output 'PASS invalid configuration rejection'
+    $script:ConfigFile = Join-Path $testRoot 'legacy-config.json'
+    Write-JsonFile $script:ConfigFile @{ SshHost='Example'; ProxyPort=7890; RemoteFolder='' }
+    Assert-Test ((Read-Configuration).AutoDetectProxyPort -eq $true) 'Legacy configuration did not enable automatic detection.'
+    Write-Output 'PASS legacy configuration migration'
 } finally {
     $listener.Stop()
     Remove-Item Env:CODEX_SWITCH_TEST_MODE -ErrorAction SilentlyContinue

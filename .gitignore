@@ -1,6 +1,7 @@
 # Personal connection settings and runtime data
 /config.json
 /runtime/
+/dist/
 /.test-artifacts/
 
 # Local editor and OS files

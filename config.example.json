@@ -1,5 +1,6 @@
 {
   "SshHost": "my-server",
   "ProxyPort": 7890,
+  "AutoDetectProxyPort": true,
   "RemoteFolder": "/home/user/project"
 }
