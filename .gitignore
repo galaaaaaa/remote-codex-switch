@@ -1,0 +1,17 @@
+# Personal connection settings and runtime data
+/config.json
+/runtime/
+/.test-artifacts/
+
+# Local editor and OS files
+/.vscode/
+.DS_Store
+Thumbs.db
+
+# Credentials and local logs
+.env
+.env.*
+*.log
+*.pem
+*.key
+auth.json
