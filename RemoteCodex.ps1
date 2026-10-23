@@ -1,5 +1,5 @@
 ﻿param(
-    [ValidateSet('Start', 'Stop', 'Setup', 'Server', 'Detect')]
+    [ValidateSet('Start', 'Stop', 'Setup', 'Server', 'Detect', 'SyncLogin')]
     [string]$Action = 'Start',
     [switch]$GuiMode
 )
@@ -291,8 +291,12 @@ function Write-IsolatedSshConfig($Destination) {
     [IO.File]::WriteAllText($Destination, $copy, $script:Utf8)
 }
 
-function Get-RemoteCommand {
-    # This remote command only reads configuration. It writes no remote files.
+function Get-RemoteCommand([int]$ProxyPort, [string]$SessionId) {
+    if ($ProxyPort -lt 1024 -or $ProxyPort -gt 65535 -or $SessionId -notmatch '^[a-f0-9]{32}$') {
+        throw '代理会话参数无效。'
+    }
+    # Only this session's launcher is written remotely. No shell startup files,
+    # shared VS Code settings, extension binaries, or account files are changed.
     $remoteScript = @'
 set -eu
 printf 'CODEX_SWITCH_HOME=%s\n' "$(printf %s "$HOME" | base64 | tr -d '\n')"
@@ -304,14 +308,53 @@ done
 if [ "$old_proxy" = 1 ]; then printf 'CODEX_SWITCH_OLD_PROXY=1\n'; fi
 machine="$HOME/.vscode-server/data/Machine/settings.json"
 if [ -f "$machine" ] && grep -Eq '"(http\.proxy|terminal\.integrated\.env\.linux)"[[:space:]]*:' "$machine"; then printf 'CODEX_SWITCH_OLD_SETTINGS=1\n'; fi
+umask 077
+session_root="$HOME/.cache/remote-codex-switch"
+mkdir -p "$session_root"
+session_dir="$session_root/__SESSION__"
+mkdir "$session_dir"
+wrapper="$session_dir/codex"
+cleanup() { rm -f "$wrapper"; rmdir "$session_dir" 2>/dev/null || true; }
+trap cleanup EXIT
+trap 'exit 0' HUP INT TERM
+cat > "$wrapper" <<'CODEX_SWITCH_WRAPPER'
+#!/bin/sh
+set -eu
+export HTTP_PROXY=http://127.0.0.1:__PORT__ HTTPS_PROXY=http://127.0.0.1:__PORT__
+export http_proxy="$HTTP_PROXY" https_proxy="$HTTPS_PROXY" ALL_PROXY="$HTTP_PROXY" all_proxy="$HTTP_PROXY"
+export NO_PROXY=localhost,127.0.0.1,::1 no_proxy=localhost,127.0.0.1,::1
+export REMOTE_CODEX_SWITCH_SESSION=__SESSION__
+case "$(uname -m)" in
+  x86_64|amd64) platform=linux-x86_64 ;;
+  aarch64|arm64) platform=linux-aarch64 ;;
+  *) printf '%s\n' 'Remote Codex: unsupported server architecture.' >&2; exit 1 ;;
+esac
+binary=$(printf '%s\n' "$HOME"/.vscode-server/extensions/openai.chatgpt-*/bin/"$platform"/codex | sort -V | while IFS= read -r candidate; do
+  if [ -f "$candidate" ] && [ -x "$candidate" ]; then printf '%s\n' "$candidate"; fi
+done | tail -n 1)
+if [ -z "$binary" ]; then
+  printf '%s\n' 'Remote Codex: install the Codex extension on this SSH server, then reconnect.' >&2
+  exit 1
+fi
+exec "$binary" "$@"
+CODEX_SWITCH_WRAPPER
+chmod 700 "$wrapper"
+printf 'CODEX_SWITCH_WRAPPER=%s\n' "$(printf %s "$wrapper" | base64 | tr -d '\n')"
+if command -v curl >/dev/null 2>&1; then
+  auth_status=$(curl --silent --output /dev/null --write-out '%{http_code}' --connect-timeout 5 --max-time 10 --noproxy '' --proxy http://127.0.0.1:__PORT__ https://auth.openai.com/.well-known/openid-configuration) || auth_status=000
+  printf 'CODEX_SWITCH_AUTH_HTTP=%s\n' "$auth_status"
+else
+  printf 'CODEX_SWITCH_AUTH_HTTP=unavailable\n'
+fi
 printf 'CODEX_SWITCH_READY\n'
 while sleep 3; do printf 'CODEX_SWITCH_ALIVE\n' || exit; done
 '@
+    $remoteScript = $remoteScript.Replace('__PORT__', [string]$ProxyPort).Replace('__SESSION__', $SessionId)
     $payload = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes(($remoteScript -replace "`r`n", "`n")))
     return 'exec sh -c "$(printf %s ' + $payload + ' | base64 -d)"'
 }
 
-function New-CodeSettings($Config, $SshCopy) {
+function New-CodeSettings($Config, $SshCopy, [string]$RemoteWrapper) {
     return [ordered]@{
         'http.proxy' = ('http://127.0.0.1:{0}' -f $Config.ProxyPort)
         'http.proxySupport' = 'on'
@@ -319,6 +362,9 @@ function New-CodeSettings($Config, $SshCopy) {
         'remote.SSH.configFile' = $SshCopy
         'remote.SSH.remotePlatform' = @{ $Config.SshHost = 'linux' }
         'chatgpt.openOnStartup' = $true
+        # This application-scoped setting is forwarded to the remote extension.
+        # http.proxy alone is machine-scoped and may be empty in that extension.
+        'chatgpt.cliExecutable' = $RemoteWrapper
         'window.title' = ('远程 Codex · ' + $Config.SshHost + ' · ${dirty}${activeEditorShort}')
         'extensions.autoUpdate' = $false
     }
@@ -378,6 +424,100 @@ function Stop-CodexTunnel {
     }
 }
 
+function Get-LoginSyncCommand {
+    $remoteScript = @'
+set -eu
+umask 077
+auth_dir=${CODEX_HOME:-"$HOME/.codex"}
+if [ -f "$auth_dir/config.toml" ] && grep -E '^[[:space:]]*cli_auth_credentials_store[[:space:]]*=' "$auth_dir/config.toml" | grep -Eq '(keyring|auto|ephemeral)'; then
+  printf '%s\n' 'Remote Codex: login sync currently requires file credential storage on the server.' >&2
+  exit 1
+fi
+mkdir -p "$auth_dir"
+if [ -L "$auth_dir/auth.json" ]; then printf '%s\n' 'Remote Codex: refusing to replace a symlinked auth.json.' >&2; exit 1; fi
+temporary=$(mktemp "$auth_dir/.remote-codex-login.XXXXXXXXXX")
+trap 'rm -f "$temporary"' EXIT
+cat > "$temporary"
+if [ ! -s "$temporary" ]; then printf '%s\n' 'Remote Codex: no login data received.' >&2; exit 1; fi
+chmod 600 "$temporary"
+if [ -f "$auth_dir/auth.json" ]; then
+  backup="$auth_dir/auth.json.remote-codex-switch-backup-$(date +%Y%m%d%H%M%S)-$$"
+  cp -p "$auth_dir/auth.json" "$backup"
+  chmod 600 "$backup"
+fi
+mv "$temporary" "$auth_dir/auth.json"
+printf 'CODEX_SWITCH_LOGIN_SYNCED\n'
+'@
+    $payload = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes(($remoteScript -replace "`r`n", "`n")))
+    return 'exec sh -c "$(printf %s ' + $payload + ' | base64 -d)"'
+}
+
+function Sync-CodexLogin([switch]$GuiMode) {
+    $config = Read-Configuration
+    $authRoot = $env:CODEX_HOME
+    if (-not $authRoot) { $authRoot = Join-Path $env:USERPROFILE '.codex' }
+    $authPath = Join-Path $authRoot 'auth.json'
+    if (-not (Test-Path -LiteralPath $authPath) -or (Get-Item -LiteralPath $authPath).Length -gt 1MB) {
+        throw '找不到可同步的本机 Codex 登录文件。请先在本机 Codex 登录；系统凭据库中的登录暂不支持此方式。'
+    }
+    # Credentials travel only over SSH stdin, never in arguments, logs or Git.
+    $authText = [IO.File]::ReadAllText($authPath, [Text.Encoding]::UTF8)
+    try { $auth = $authText | ConvertFrom-Json } catch { throw '本机 Codex 登录文件不是有效 JSON，请重新登录。' }
+    $hasTokens = $false
+    $hasApiKey = $false
+    if ($auth -and $auth.PSObject.Properties['tokens'] -and $auth.tokens) {
+        foreach ($key in @('access_token','refresh_token')) {
+            if ($auth.tokens.PSObject.Properties[$key] -and -not [string]::IsNullOrWhiteSpace([string]$auth.tokens.$key)) { $hasTokens = $true }
+        }
+    }
+    if ($auth -and $auth.PSObject.Properties['OPENAI_API_KEY']) { $hasApiKey = -not [string]::IsNullOrWhiteSpace([string]$auth.OPENAI_API_KEY) }
+    if (-not $hasTokens -and -not $hasApiKey) {
+        throw '本机文件不包含可识别的 Codex 登录数据，请重新登录。'
+    }
+    $sshExe = Get-SshExe
+    $arguments = @('-T', '-F', (Get-SshSource), '-o', 'ClearAllForwardings=yes', '-o', 'ConnectTimeout=15')
+    if ($GuiMode) { $arguments += @('-o', 'BatchMode=yes') }
+    $arguments += @($config.SshHost, (Get-LoginSyncCommand))
+        $info = New-Object Diagnostics.ProcessStartInfo
+        $info.FileName = $sshExe
+        $info.Arguments = ($arguments | ForEach-Object { Quote-NativeArgument $_ }) -join ' '
+        $info.UseShellExecute = $false
+        $info.CreateNoWindow = [bool]$GuiMode
+        $info.RedirectStandardInput = $true
+        $info.RedirectStandardOutput = $true
+        $info.RedirectStandardError = [bool]$GuiMode
+        $process = [Diagnostics.Process]::Start($info)
+        try {
+            $stdout = $process.StandardOutput.ReadToEndAsync()
+            $stderr = $null
+            if ($GuiMode) { $stderr = $process.StandardError.ReadToEndAsync() }
+            $timeout = if ($GuiMode) { 30000 } else { 180000 }
+            $write = $process.StandardInput.WriteAsync($authText)
+            if (-not $write.Wait($timeout)) { $process.Kill(); throw '同步登录超时，请检查服务器连接。' }
+            $process.StandardInput.Close()
+            if (-not $process.WaitForExit($timeout)) { $process.Kill(); throw '同步登录超时，请检查服务器连接。' }
+            $errorText = ''
+            if ($stderr) { $errorText = $stderr.Result }
+            if ($GuiMode -and $process.ExitCode -ne 0 -and $errorText -match '(?i)(permission denied|host key verification failed|sign_and_send_pubkey|authentication failed)') {
+                Write-Host '同步需要 SSH 登录，请在弹出的窗口输入密码或确认主机。'
+                $shell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+                $syncArgs = @('-NoLogo','-NoProfile','-ExecutionPolicy','Bypass','-File',(Join-Path $script:PackageRoot 'RemoteCodex.ps1'),'-Action','SyncLogin')
+                $interactive = Start-Process -FilePath $shell -ArgumentList (($syncArgs | ForEach-Object { Quote-NativeArgument $_ }) -join ' ') -WindowStyle Normal -Wait -PassThru
+                if ($interactive.ExitCode -ne 0) { throw '同步登录未完成，请查看 SSH 登录窗口的提示。' }
+                Write-Host '同步窗口已完成。请重新加载远端 Codex；联网仍需保持代理连接。'
+                return
+            }
+            if ($process.ExitCode -ne 0 -or -not $stdout.Result.Contains('CODEX_SWITCH_LOGIN_SYNCED')) {
+                throw '同步登录失败，请检查 SSH 权限，以及远端是否使用文件方式保存 Codex 登录。'
+            }
+        } finally {
+            if (-not $process.HasExited) { $process.Kill() }
+            $process.Dispose()
+        }
+    Write-Host '本机登录已通过 SSH 同步到所选服务器。旧文件（如有）已在远端备份。' -ForegroundColor Green
+    Write-Host '请重新加载远端 Codex。登录同步不会修复网络；使用和刷新登录仍需要代理连接。'
+}
+
 function Start-CodexSession([switch]$GuiMode) {
     [IO.Directory]::CreateDirectory($script:RuntimeRoot) | Out-Null
     $lockPath = Join-Path $script:RuntimeRoot 'session.lock'
@@ -415,11 +555,11 @@ function Start-CodexSession([switch]$GuiMode) {
         }
         $userData = Join-Path $script:RuntimeRoot 'vscode-data'
         $settingsFile = Join-Path $userData 'User\settings.json'
-        Write-JsonFile $settingsFile (New-CodeSettings $config $sshCopy)
         $log = Join-Path $script:RuntimeRoot 'connection.log'
         $errorLog = Join-Path $script:RuntimeRoot 'ssh-error.log'
         $forward = '127.0.0.1:{0}:127.0.0.1:{0}' -f $config.ProxyPort
-        $sshArguments = @('-n', '-T', '-F', $sshCopy, '-o', 'ExitOnForwardFailure=yes', '-o', 'ServerAliveInterval=15', '-o', 'ServerAliveCountMax=2', '-o', 'ConnectTimeout=15', '-R', $forward, $config.SshHost, (Get-RemoteCommand))
+        $sessionId = [Guid]::NewGuid().ToString('N')
+        $sshArguments = @('-n', '-T', '-F', $sshCopy, '-o', 'ExitOnForwardFailure=yes', '-o', 'ServerAliveInterval=15', '-o', 'ServerAliveCountMax=2', '-o', 'ConnectTimeout=15', '-R', $forward, $config.SshHost, (Get-RemoteCommand $config.ProxyPort $sessionId))
         Write-Host '正在建立连接。如提示密码或首次确认主机，请在此窗口完成。' -ForegroundColor Cyan
         $interactiveFallback = $false
         if ($GuiMode) {
@@ -460,6 +600,18 @@ function Start-CodexSession([switch]$GuiMode) {
         if (-not $received.Contains('CODEX_SWITCH_READY')) { throw '等待 SSH 登录超时，请重新启动。' }
         if ($received -notmatch 'CODEX_SWITCH_HOME=([A-Za-z0-9+/=]+)') { throw '无法读取远程主目录。' }
         $remoteHome = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($Matches[1]))
+        if ($received -notmatch 'CODEX_SWITCH_WRAPPER=([A-Za-z0-9+/=]+)') { throw '无法准备远端 Codex 代理启动器，请重新连接。' }
+        $remoteWrapper = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($Matches[1]))
+        if (-not $remoteWrapper.StartsWith($remoteHome + '/.cache/remote-codex-switch/') -or -not $remoteWrapper.EndsWith('/codex')) {
+            throw '远端 Codex 启动器路径无效。'
+        }
+        if ($received -match 'CODEX_SWITCH_AUTH_HTTP=([^\r\n]+)') {
+            $authStatus = $Matches[1]
+            if ($authStatus -eq '200') { Write-Host '已验证：服务器可通过该隧道连接 OpenAI 登录服务。' -ForegroundColor Green }
+            elseif ($authStatus -eq 'unavailable') { Write-Warning '服务器没有 curl，尚未验证 OpenAI 登录服务是否可达。' }
+            else { throw ('代理链路检查未通过：OpenAI 登录服务 HTTP ' + $authStatus + '。000 通常表示连接失败；403 需要查看节点或服务返回的具体错误。') }
+        }
+        Write-JsonFile $settingsFile (New-CodeSettings $config $sshCopy $remoteWrapper)
         if ($received.Contains('CODEX_SWITCH_OLD_PROXY=1') -or $received.Contains('CODEX_SWITCH_OLD_SETTINGS=1')) {
             Write-Warning '检测到服务器可能留有旧代理设置。本开关不会清理它们，普通终端可能仍受影响。请查看“README.md”的旧配置部分。'
         }
@@ -469,7 +621,7 @@ function Start-CodexSession([switch]$GuiMode) {
         Write-JsonFile $workspace (New-Workspace $config $remoteHome)
         $code = Start-CodeClient $install $workspace $userData $extensions
         Write-Host ''
-        Write-Host '隧道已建立，正在打开远程 Codex 专用窗口。' -ForegroundColor Green
+        Write-Host '远端 Codex 代理启动器已准备，正在打开 VS Code 专用窗口。' -ForegroundColor Green
         Write-Host '用完关闭该 VS Code 窗口，隧道会自动停止；也可双击“关闭远程Codex.cmd”。'
         Write-Host '此窗口请保持打开。首次使用可能需要在远端安装 Codex 扩展并登录。'
         while (-not $code.HasExited -and -not $ssh.HasExited -and -not (Test-Path -LiteralPath $stopFile)) { Start-Sleep -Milliseconds 500 }
@@ -493,6 +645,7 @@ function Start-CodexSession([switch]$GuiMode) {
         if ($settingsFile -and (Test-Path -LiteralPath $settingsFile)) {
             $settings = Get-Content -LiteralPath $settingsFile -Raw -Encoding UTF8 | ConvertFrom-Json
             $settings.'http.proxy' = ''
+            if ($settings.PSObject.Properties['chatgpt.cliExecutable']) { $settings.'chatgpt.cliExecutable' = $null }
             Write-JsonFile $settingsFile $settings
         }
         if ($lock) {
@@ -510,6 +663,7 @@ try {
         'Setup' { Set-Configuration }
         'Server' { Set-Server }
         'Detect' { Detect-ProxyPort }
+        'SyncLogin' { Sync-CodexLogin -GuiMode:$GuiMode }
     }
 } catch {
     Write-Host ("操作未完成：" + $_.Exception.Message) -ForegroundColor Red

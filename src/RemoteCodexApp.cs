@@ -15,8 +15,8 @@ using System.Web.Script.Serialization;
 using System.Windows.Forms;
 
 [assembly: AssemblyTitle("Remote Codex Switch")]
-[assembly: AssemblyVersion("0.2.0.0")]
-[assembly: AssemblyFileVersion("0.2.0.0")]
+[assembly: AssemblyVersion("0.3.0.0")]
+[assembly: AssemblyFileVersion("0.3.0.0")]
 
 namespace RemoteCodexSwitch {
     public sealed class AppConfig {
@@ -137,7 +137,7 @@ namespace RemoteCodexSwitch {
         readonly Color ink = Color.FromArgb(25, 35, 54), muted = Color.FromArgb(105, 116, 135), blue = Color.FromArgb(38, 99, 235);
         readonly bool preview;
         ComboBox servers, ports; TextBox folder; CheckBox auto;
-        Button refresh, detect, start, stop, save, editSsh;
+        Button refresh, detect, start, stop, save, editSsh, syncLogin;
         Label badge, hint, footer; TextBox log;
         ProgressBar progress; System.Windows.Forms.Timer timer;
         Process controller; bool busy, closing, fillingPorts, needsPortChoice;
@@ -148,7 +148,7 @@ namespace RemoteCodexSwitch {
         string Runtime { get { return Path.Combine(Program.DataRoot, "runtime"); } }
         public MainForm(bool preview) {
             this.preview = preview;
-            Text = "Remote Codex · 远程连接开关";
+            Text = "Remote Codex · 远程连接开关 · v0.3.0";
             ClientSize = new Size(920, 744); MinimumSize = Size; MaximumSize = Size;
             MaximizeBox = false; StartPosition = FormStartPosition.CenterScreen;
             BackColor = Color.FromArgb(245, 247, 251); ForeColor = ink;
@@ -176,6 +176,7 @@ namespace RemoteCodexSwitch {
             AddLabel(card, "支持自动识别，也可以直接输入端口号。", 24, 249, 800, 22, 9F, muted, false);
             start = MakeButton(this, "开启远程 Codex", 32, 424, 224, 46, true);
             stop = MakeButton(this, "关闭连接", 272, 424, 140, 46, false);
+            syncLogin = MakeButton(this, "同步本机登录", 428, 424, 164, 46, false);
             save = MakeButton(this, "保存设置", 608, 424, 132, 46, false);
             editSsh = MakeButton(this, "SSH 配置", 756, 424, 132, 46, false);
             hint = AddLabel(this, "选择服务器，打开本机代理，再点击开启。", 34, 488, 850, 28, 10F, muted, false);
@@ -189,6 +190,7 @@ namespace RemoteCodexSwitch {
             detect.Click += async delegate { await DetectAsync(true); };
             start.Click += async delegate { await StartAsync(); };
             stop.Click += async delegate { await StopAsync(); };
+            syncLogin.Click += async delegate { await SyncLoginAsync(); };
             save.Click += delegate { try { SaveConfig(ReadControls()); AppendLog("设置已保存。"); } catch (Exception ex) { ShowError(ex.Message); } };
             editSsh.Click += delegate {
                 try { Directory.CreateDirectory(Path.GetDirectoryName(Program.SshConfig)); if (!File.Exists(Program.SshConfig)) File.WriteAllText(Program.SshConfig, "", Program.Utf8); Process.Start("notepad.exe", Program.Quote(Program.SshConfig)); }
@@ -234,6 +236,7 @@ namespace RemoteCodexSwitch {
             if(closing) return;
             bool idle = !busy && !Running;
             foreach (Control c in new Control[] { servers,ports,folder,auto,refresh,detect,save,start,editSsh }) c.Enabled=idle;
+            syncLogin.Enabled=!busy;
             stop.Enabled=Running && !busy; progress.Visible=busy;
         }
         void LoadServers() {
@@ -322,6 +325,23 @@ namespace RemoteCodexSwitch {
             } catch (Exception ex) { ShowError(ex.Message); }
             finally { if(controller!=null && !Running) { controller.Dispose(); controller=null; } busy=false; UpdateControls(); }
         }
+        async Task SyncLoginAsync() {
+            if (busy) return;
+            try {
+                AppConfig config=ReadControls();
+                if (MessageBox.Show(this,
+                    "将把本机 Codex 登录文件通过 SSH 发送给服务器「"+config.SshHost+"」的登录用户。\n\n该服务器用户下的其他 Codex 窗口也会共用此登录。已有登录文件会先备份；请只同步到你信任的服务器。\n\n同步后仍需保持代理连接。是否继续？",
+                    "同步本机 Codex 登录",MessageBoxButtons.OKCancel,MessageBoxIcon.Information)!=DialogResult.OK) return;
+                SaveConfig(config); busy=true; UpdateControls();
+                hint.Text="正在通过 SSH 同步登录；此过程不会将登录文件上传到 GitHub。";
+                RunResult result=await Program.RunBackend("RemoteCodex.ps1","-Action SyncLogin -GuiMode");
+                AppendLog(result.Output);
+                if(result.ExitCode!=0) throw new Exception("同步未完成。请确认本机 Codex 已登录，并检查运行记录。");
+                hint.Text="登录已同步。请重新加载远端 Codex；使用时仍需保持代理连接。";
+                AppendLog(hint.Text);
+            } catch(Exception ex) { ShowError(ex.Message); }
+            finally { busy=false; UpdateControls(); }
+        }
         void PollSession() {
             if (busy || controller==null) return;
             if (!Running) {
@@ -341,8 +361,8 @@ namespace RemoteCodexSwitch {
                         if(!reader.ReadToEnd().Contains("CODEX_SWITCH_READY")) return;
                     }
                 }
-                SetBadge("隧道已连接",Color.FromArgb(224,244,234),Color.FromArgb(24,119,77));
-                hint.Text="代理隧道已建立，VS Code 专用窗口正在打开或已打开。";
+                SetBadge("SSH 已连接",Color.FromArgb(224,244,234),Color.FromArgb(24,119,77));
+                hint.Text="SSH 已连接。代理检查结果请看运行记录；账号登录需在 Codex 面板确认。";
             } catch { }
         }
         void OnClosing(object sender,FormClosingEventArgs e) {

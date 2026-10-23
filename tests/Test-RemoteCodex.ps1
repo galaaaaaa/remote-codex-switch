@@ -21,6 +21,8 @@ public class MockEntry {
         if (ssh) {
             if (Array.IndexOf(args, "-G") >= 0) { Console.WriteLine("hostname example.invalid"); return 0; }
             Console.WriteLine("CODEX_SWITCH_HOME=L2hvbWUvZXhhbXBsZQ==");
+            Console.WriteLine("CODEX_SWITCH_WRAPPER="+Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes("/home/example/.cache/remote-codex-switch/test/codex")));
+            Console.WriteLine("CODEX_SWITCH_AUTH_HTTP="+(mode=="proxy-error"?"403":"200"));
             Console.WriteLine("CODEX_SWITCH_READY");
             Console.Out.Flush();
             if (mode == "ssh-drop") { Thread.Sleep(1200); return 23; }
@@ -52,7 +54,7 @@ $listener.Start()
 $testPort = $listener.LocalEndpoint.Port
 try {
     Test-ProxyPort $testPort
-    foreach ($mode in @('window-close','gui-window-close','user-stop','ssh-drop','code-error')) {
+    foreach ($mode in @('window-close','gui-window-close','user-stop','ssh-drop','code-error','proxy-error')) {
         $env:CODEX_SWITCH_TEST_MODE = $mode
         $script:RuntimeRoot = Join-Path $testRoot $mode
         $script:ConfigFile = Join-Path $testRoot ($mode + '.json')
@@ -60,14 +62,21 @@ try {
         Write-JsonFile $script:ConfigFile $cfg
         $caught = $false
         try { Start-CodexSession -GuiMode:($mode -eq 'gui-window-close') } catch {
-            if ($mode -ne 'code-error') { throw }
-            Assert-Test ($_.Exception.Message -like '*42*') 'Unexpected code error.'
+            if ($mode -notin @('code-error','proxy-error')) { throw }
+            $expected = if ($mode -eq 'code-error') { '*42*' } else { '*HTTP 403*' }
+            Assert-Test ($_.Exception.Message -like $expected) 'Unexpected connection error.'
             $caught = $true
         }
-        if ($mode -eq 'code-error') { Assert-Test $caught 'VS Code error was not propagated.' }
+        if ($mode -in @('code-error','proxy-error')) { Assert-Test $caught 'Connection error was not propagated.' }
         Assert-Test (-not (Test-Path -LiteralPath (Join-Path $script:RuntimeRoot 'session.json'))) 'State was not cleared.'
+        if ($mode -eq 'proxy-error') {
+            Assert-Test (-not (Test-Path -LiteralPath (Join-Path $script:RuntimeRoot 'vscode-data\User\settings.json'))) 'VS Code was configured despite failed proxy validation.'
+            Write-Output 'PASS failed proxy validation blocks the editor'
+            continue
+        }
         $settings = Get-Content -LiteralPath (Join-Path $script:RuntimeRoot 'vscode-data\User\settings.json') -Raw -Encoding UTF8 | ConvertFrom-Json
         Assert-Test ($settings.'http.proxy' -eq '') 'Proxy setting was not reset.'
+        Assert-Test ($null -eq $settings.'chatgpt.cliExecutable') 'Remote launcher setting was not reset.'
         $workspaceFiles = @(Get-ChildItem -LiteralPath $script:RuntimeRoot -Filter 'Remote-Codex-*.code-workspace')
         Assert-Test ($workspaceFiles.Count -eq 1) 'A distinct workspace was not created for this session.'
         $workspaceText = Get-Content -LiteralPath $workspaceFiles[0].FullName -Raw -Encoding UTF8

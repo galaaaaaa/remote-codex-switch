@@ -16,3 +16,4 @@ Thumbs.db
 *.pem
 *.key
 auth.json
+auth.json.*
