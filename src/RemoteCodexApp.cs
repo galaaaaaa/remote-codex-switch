@@ -15,8 +15,8 @@ using System.Web.Script.Serialization;
 using System.Windows.Forms;
 
 [assembly: AssemblyTitle("Remote Codex Switch")]
-[assembly: AssemblyVersion("0.4.0.0")]
-[assembly: AssemblyFileVersion("0.4.0.0")]
+[assembly: AssemblyVersion("0.4.1.0")]
+[assembly: AssemblyFileVersion("0.4.1.0")]
 
 namespace RemoteCodexSwitch {
     public sealed class AppConfig {
@@ -41,6 +41,7 @@ namespace RemoteCodexSwitch {
         public static readonly JavaScriptSerializer Json = new JavaScriptSerializer();
         public static readonly UTF8Encoding Utf8 = new UTF8Encoding(false);
         public static EventWaitHandle ShowRequest;
+        public static EventWaitHandle ExitRequest;
         public static string DataRoot { get { return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "RemoteCodexSwitch"); } }
         public static string SshConfig { get { return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".ssh", "config"); } }
         public static string PowerShell { get { return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.System), "WindowsPowerShell", "v1.0", "powershell.exe"); } }
@@ -123,9 +124,12 @@ namespace RemoteCodexSwitch {
                 bool created;
                 using (var mutex = new Mutex(true, @"Local\RemoteCodexSwitch.Desktop", out created)) {
                     using(ShowRequest=new EventWaitHandle(false,EventResetMode.AutoReset,@"Local\RemoteCodexSwitch.Show")) {
-                        if (!created) { ShowRequest.Set(); return 0; }
+                    using(ExitRequest=new EventWaitHandle(false,EventResetMode.AutoReset,@"Local\RemoteCodexSwitch.Exit")) {
+                        if (!created) { if(args.Contains("--exit")) ExitRequest.Set(); else ShowRequest.Set(); return 0; }
+                        if(args.Contains("--exit")) return 0;
                         InstallBackend();
                         Application.Run(new MainForm(false));
+                    }
                     }
                 }
                 return 0;
@@ -152,7 +156,7 @@ namespace RemoteCodexSwitch {
         string Runtime { get { return Path.Combine(Program.DataRoot, "runtime"); } }
         public MainForm(bool preview) {
             this.preview = preview;
-            Text = "Remote Codex · 共享连接 · v0.4.0";
+            Text = "Remote Codex · 共享连接 · v0.4.1";
             ClientSize = new Size(920, 744); MinimumSize = Size; MaximumSize = Size;
             MaximizeBox = false; StartPosition = FormStartPosition.CenterScreen;
             BackColor = Color.FromArgb(245, 247, 251); ForeColor = ink;
@@ -231,7 +235,11 @@ namespace RemoteCodexSwitch {
             }
             UpdateControls();
             timer = new System.Windows.Forms.Timer { Interval=600 };
-            timer.Tick += delegate { if(Program.ShowRequest!=null && Program.ShowRequest.WaitOne(0)) ShowFromTray(); PollSession(); };
+            timer.Tick += delegate {
+                if(Program.ExitRequest!=null && Program.ExitRequest.WaitOne(0)) { allowExit=true; Close(); return; }
+                if(Program.ShowRequest!=null && Program.ShowRequest.WaitOne(0)) ShowFromTray();
+                PollSession();
+            };
             if (!preview) timer.Start();
         }
         Label AddLabel(Control parent, string text, int x, int y, int w, int h, float size, Color color, bool bold) {

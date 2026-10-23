@@ -67,7 +67,7 @@ def edit(text, key, present, value=None):
         if comma:
             return text[:key_start] + text[comma.end():]
         if previous:
-            return text[:previous.start()] + text[value_end:]
+            return text[:previous.start()] + text[previous.end():key_start] + text[value_end:]
         return text[:key_start] + text[value_end:]
     if not present:
         return text

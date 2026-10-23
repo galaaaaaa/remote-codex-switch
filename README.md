@@ -2,7 +2,7 @@
 
 Windows 可视化开关：选择 SSH 服务器、识别本机代理端口，按需为远端 VS Code 的 Codex 开启共享连接。
 
-**[下载 v0.4.0](https://github.com/galaaaaaa/remote-codex-switch/releases/tag/v0.4.0)** · [应用源码](src/RemoteCodexApp.cs)
+**[下载 v0.4.1](https://github.com/galaaaaaa/remote-codex-switch/releases/tag/v0.4.1)** · [应用源码](src/RemoteCodexApp.cs)
 
 ![应用界面，使用示例配置](docs/app-preview.png)
 

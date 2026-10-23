@@ -47,6 +47,14 @@ class SharedSettingsTests(unittest.TestCase):
         self.lease.recover()
         self.assertEqual(document(self.read())[0], {'http.proxy': 'http://user.invalid:5678'})
 
+    def test_comment_after_original_trailing_comma_survives_edits(self):
+        self.write('{"other": true, // keep this note\n}')
+        self.lease.enable(7897, 'b'*32)
+        self.write(edit(self.read(), 'other', True, False))
+        self.lease.recover()
+        self.assertEqual(document(self.read())[0], {'other': False})
+        self.assertIn('// keep this note', self.read())
+
     def test_new_settings_file_removed_on_stop(self):
         self.lease.enable(7897, 'd'*32)
         self.lease.recover()
