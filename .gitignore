@@ -17,3 +17,4 @@ Thumbs.db
 *.key
 auth.json
 auth.json.*
+__pycache__/

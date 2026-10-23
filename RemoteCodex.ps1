@@ -1,5 +1,5 @@
 ﻿param(
-    [ValidateSet('Start', 'Stop', 'Setup', 'Server', 'Detect', 'SyncLogin')]
+    [ValidateSet('Start', 'Stop', 'Setup', 'Server', 'Detect', 'SyncLogin', 'Open')]
     [string]$Action = 'Start',
     [switch]$GuiMode
 )
@@ -292,112 +292,70 @@ function Write-IsolatedSshConfig($Destination) {
 }
 
 function Get-RemoteCommand([int]$ProxyPort, [string]$SessionId) {
-    if ($ProxyPort -lt 1024 -or $ProxyPort -gt 65535 -or $SessionId -notmatch '^[a-f0-9]{32}$') {
-        throw '代理会话参数无效。'
-    }
-    # Only this session's launcher is written remotely. No shell startup files,
-    # shared VS Code settings, extension binaries, or account files are changed.
-    $remoteScript = @'
-set -eu
-printf 'CODEX_SWITCH_HOME=%s\n' "$(printf %s "$HOME" | base64 | tr -d '\n')"
-old_proxy=0
-if [ -n "${HTTP_PROXY-}${HTTPS_PROXY-}${http_proxy-}${https_proxy-}${ALL_PROXY-}${all_proxy-}" ]; then old_proxy=1; fi
-for file in "$HOME/.bashrc" "$HOME/.profile" "$HOME/.bash_profile"; do
-  if [ -f "$file" ] && grep -Eq '^[[:space:]]*(export[[:space:]]+)?(HTTP_PROXY|HTTPS_PROXY|http_proxy|https_proxy|ALL_PROXY|all_proxy)[[:space:]]*=' "$file"; then old_proxy=1; fi
-done
-if [ "$old_proxy" = 1 ]; then printf 'CODEX_SWITCH_OLD_PROXY=1\n'; fi
-machine="$HOME/.vscode-server/data/Machine/settings.json"
-if [ -f "$machine" ] && grep -Eq '"(http\.proxy|terminal\.integrated\.env\.linux)"[[:space:]]*:' "$machine"; then printf 'CODEX_SWITCH_OLD_SETTINGS=1\n'; fi
-umask 077
-session_root="$HOME/.cache/remote-codex-switch"
-mkdir -p "$session_root"
-session_dir="$session_root/__SESSION__"
-mkdir "$session_dir"
-wrapper="$session_dir/codex"
-cleanup() { rm -f "$wrapper"; rmdir "$session_dir" 2>/dev/null || true; }
-trap cleanup EXIT
-trap 'exit 0' HUP INT TERM
-cat > "$wrapper" <<'CODEX_SWITCH_WRAPPER'
-#!/bin/sh
-set -eu
-export HTTP_PROXY=http://127.0.0.1:__PORT__ HTTPS_PROXY=http://127.0.0.1:__PORT__
-export http_proxy="$HTTP_PROXY" https_proxy="$HTTPS_PROXY" ALL_PROXY="$HTTP_PROXY" all_proxy="$HTTP_PROXY"
-export NO_PROXY=localhost,127.0.0.1,::1 no_proxy=localhost,127.0.0.1,::1
-export REMOTE_CODEX_SWITCH_SESSION=__SESSION__
-case "$(uname -m)" in
-  x86_64|amd64) platform=linux-x86_64 ;;
-  aarch64|arm64) platform=linux-aarch64 ;;
-  *) printf '%s\n' 'Remote Codex: unsupported server architecture.' >&2; exit 1 ;;
-esac
-binary=$(printf '%s\n' "$HOME"/.vscode-server/extensions/openai.chatgpt-*/bin/"$platform"/codex | sort -V | while IFS= read -r candidate; do
-  if [ -f "$candidate" ] && [ -x "$candidate" ]; then printf '%s\n' "$candidate"; fi
-done | tail -n 1)
-if [ -z "$binary" ]; then
-  printf '%s\n' 'Remote Codex: install the Codex extension on this SSH server, then reconnect.' >&2
-  exit 1
-fi
-exec "$binary" "$@"
-CODEX_SWITCH_WRAPPER
-chmod 700 "$wrapper"
-printf 'CODEX_SWITCH_WRAPPER=%s\n' "$(printf %s "$wrapper" | base64 | tr -d '\n')"
-if command -v curl >/dev/null 2>&1; then
-  auth_status=$(curl --silent --output /dev/null --write-out '%{http_code}' --connect-timeout 5 --max-time 10 --noproxy '' --proxy http://127.0.0.1:__PORT__ https://auth.openai.com/.well-known/openid-configuration) || auth_status=000
-  printf 'CODEX_SWITCH_AUTH_HTTP=%s\n' "$auth_status"
-else
-  printf 'CODEX_SWITCH_AUTH_HTTP=unavailable\n'
-fi
-printf 'CODEX_SWITCH_READY\n'
-while sleep 3; do printf 'CODEX_SWITCH_ALIVE\n' || exit; done
-'@
-    $remoteScript = $remoteScript.Replace('__PORT__', [string]$ProxyPort).Replace('__SESSION__', $SessionId)
-    $payload = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes(($remoteScript -replace "`r`n", "`n")))
-    return 'exec sh -c "$(printf %s ' + $payload + ' | base64 -d)"'
+    if ($ProxyPort -lt 1024 -or $ProxyPort -gt 65535 -or $SessionId -notmatch '^[a-f0-9]{32}$') { throw '代理会话参数无效。' }
+    $source = [IO.File]::ReadAllText((Join-Path $script:PackageRoot 'RemoteSession.py'))
+    $payload = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($source))
+    return ('exec python3 -u -c "import base64;exec(base64.b64decode(''{0}''))" {1} {2}' -f $payload,$ProxyPort,$SessionId)
 }
 
-function New-CodeSettings($Config, $SshCopy, [string]$RemoteWrapper) {
-    return [ordered]@{
-        'http.proxy' = ('http://127.0.0.1:{0}' -f $Config.ProxyPort)
-        'http.proxySupport' = 'on'
-        'http.useLocalProxyConfiguration' = $true
-        'remote.SSH.configFile' = $SshCopy
-        'remote.SSH.remotePlatform' = @{ $Config.SshHost = 'linux' }
-        'chatgpt.openOnStartup' = $true
-        # This application-scoped setting is forwarded to the remote extension.
-        # http.proxy alone is machine-scoped and may be empty in that extension.
-        'chatgpt.cliExecutable' = $RemoteWrapper
-        'window.title' = ('远程 Codex · ' + $Config.SshHost + ' · ${dirty}${activeEditorShort}')
-        'extensions.autoUpdate' = $false
-    }
-}
-
-function New-Workspace($Config, [string]$RemoteHome) {
-    $folder = [string]$Config.RemoteFolder
-    if (-not $folder) { $folder = $RemoteHome }
-    $escapedPath = (($folder -split '/', 0, 'SimpleMatch' | ForEach-Object { [Uri]::EscapeDataString($_) }) -join '/')
-    # Linux environment variable names are case-sensitive; PowerShell hashtables are not.
-    $terminalEnv = [Collections.Generic.Dictionary[string,object]]::new([StringComparer]::Ordinal)
-    foreach ($key in @('HTTP_PROXY','HTTPS_PROXY','http_proxy','https_proxy','ALL_PROXY','all_proxy','NO_PROXY','no_proxy')) {
-        $terminalEnv[$key] = $null
-    }
-    return [ordered]@{
-        folders = @(@{ uri = ('vscode-remote://ssh-remote+' + $Config.SshHost + $escapedPath) })
-        settings = @{
-            'terminal.integrated.env.linux' = $terminalEnv
-        }
-    }
-}
-
-function Start-CodeClient($Install, $Workspace, $UserData, $Extensions) {
+function Start-SshChannel($Executable, $Arguments, $Log, $ErrorLog, [switch]$Batch) {
     $info = New-Object Diagnostics.ProcessStartInfo
-    $info.FileName = $Install.Exe
-    $argsForCode = @($Install.Cli, '--new-window', '--wait', '--user-data-dir', $UserData, '--extensions-dir', $Extensions, $Workspace)
-    $info.Arguments = ($argsForCode | ForEach-Object { Quote-NativeArgument $_ }) -join ' '
+    $info.FileName = $Executable
+    $info.Arguments = ($Arguments | ForEach-Object { Quote-NativeArgument $_ }) -join ' '
+    $info.UseShellExecute = $false
+    $info.CreateNoWindow = [bool]$Batch
+    $info.RedirectStandardInput = $true
+    $info.RedirectStandardOutput = $true
+    $info.RedirectStandardError = [bool]$Batch
+    $output = [IO.FileStream]::new($Log,[IO.FileMode]::Create,[IO.FileAccess]::Write,[IO.FileShare]::ReadWrite,1,$true)
+    $errors = $null
+    try {
+        if ($Batch) { $errors = [IO.FileStream]::new($ErrorLog,[IO.FileMode]::Create,[IO.FileAccess]::Write,[IO.FileShare]::ReadWrite,1,$true) }
+        $process = [Diagnostics.Process]::Start($info)
+        $copy = $process.StandardOutput.BaseStream.CopyToAsync($output)
+        $errorCopy = $null
+        if ($errors) { $errorCopy = $process.StandardError.BaseStream.CopyToAsync($errors) }
+        return [pscustomobject]@{ Process=$process; Output=$output; Errors=$errors; Copy=$copy; ErrorCopy=$errorCopy }
+    } catch { $output.Dispose(); if($errors){$errors.Dispose()}; throw }
+}
+
+function Send-SshHeartbeat($Channel) {
+    if ($Channel -and -not $Channel.Process.HasExited) {
+        try { $Channel.Process.StandardInput.WriteLine('PING'); $Channel.Process.StandardInput.Flush() } catch { }
+    }
+}
+
+function Close-SshChannel($Channel) {
+    if (-not $Channel) { return }
+    $process = $Channel.Process
+    try {
+        if (-not $process.HasExited) {
+            try { $process.StandardInput.WriteLine('STOP'); $process.StandardInput.Close() } catch { }
+            if (-not $process.WaitForExit(5000)) { $process.Kill(); $process.WaitForExit(2000) | Out-Null }
+        }
+        try { $Channel.Copy.Wait(2000) | Out-Null } catch { }
+        if ($Channel.ErrorCopy) { try { $Channel.ErrorCopy.Wait(2000) | Out-Null } catch { } }
+    } finally {
+        $Channel.Output.Dispose()
+        if ($Channel.Errors) { $Channel.Errors.Dispose() }
+        $process.Dispose()
+    }
+}
+
+function Open-RemoteProject {
+    $config = Read-Configuration
+    $install = Find-CodeInstallation
+    $arguments = @($install.Cli,'--new-window','--remote',('ssh-remote+' + $config.SshHost))
+    if ($config.RemoteFolder) { $arguments += [string]$config.RemoteFolder }
+    $info = New-Object Diagnostics.ProcessStartInfo
+    $info.FileName = $install.Exe
+    $info.Arguments = ($arguments | ForEach-Object { Quote-NativeArgument $_ }) -join ' '
     $info.UseShellExecute = $false
     $info.CreateNoWindow = $true
     $info.EnvironmentVariables['ELECTRON_RUN_AS_NODE'] = '1'
-    $info.EnvironmentVariables.Remove('VSCODE_DEV')
     $info.EnvironmentVariables.Remove('VSCODE_IPC_HOOK_CLI')
-    return [Diagnostics.Process]::Start($info)
+    [Diagnostics.Process]::Start($info) | Out-Null
+    Write-Host '已请求打开普通 VS Code 远程窗口。关闭该窗口不会停止共享连接。'
 }
 
 function Get-TrackedSsh($StateFile) {
@@ -417,8 +375,8 @@ function Stop-CodexTunnel {
     $stateFile = Join-Path $script:RuntimeRoot 'session.json'
     $process = Get-TrackedSsh $stateFile
     if ($process) {
-        Stop-Process -Id $process.Id -ErrorAction Stop
-        Write-Host '已停止本工具建立的代理隧道。专用 VS Code 窗口可以关闭。' -ForegroundColor Green
+        if (-not $process.WaitForExit(8000)) { Stop-Process -Id $process.Id -ErrorAction Stop }
+        Write-Host '共享连接已停止。远端代理设置会恢复，已启动的 Codex 如需继续使用请重新加载窗口。' -ForegroundColor Green
     } else {
         Write-Host '当前没有本工具建立的活动隧道。'
     }
@@ -522,132 +480,74 @@ function Start-CodexSession([switch]$GuiMode) {
     [IO.Directory]::CreateDirectory($script:RuntimeRoot) | Out-Null
     $lockPath = Join-Path $script:RuntimeRoot 'session.lock'
     $lock = $null
-    $ssh = $null
-    $code = $null
-    $settingsFile = $null
+    $channel = $null
     $ownsState = $false
     $stateFile = Join-Path $script:RuntimeRoot 'session.json'
     $stopFile = Join-Path $script:RuntimeRoot 'stop.request'
     try {
-        try { $lock = [IO.File]::Open($lockPath, 'OpenOrCreate', 'ReadWrite', 'None') }
-        catch { throw '启动器已经在运行。请先关闭专用窗口，或双击“关闭远程Codex.cmd”。' }
-        if (Get-TrackedSsh $stateFile) { throw '检测到上一次的隧道仍在运行，请先双击“关闭远程Codex.cmd”。' }
+        try { $lock = [IO.File]::Open($lockPath,'OpenOrCreate','ReadWrite','None') }
+        catch { throw '共享连接已经在运行，请使用已有应用或先关闭连接。' }
+        if (Get-TrackedSsh $stateFile) { throw '上一次连接仍在运行，请先关闭连接。' }
         if (Test-Path -LiteralPath $stopFile) { Remove-Item -LiteralPath $stopFile -Force }
         $config = Read-Configuration
-        $install = Find-CodeInstallation
-        $sshExe = Get-SshExe
-        $extensions = Get-ExtensionDirectory
-        if (-not (Test-Path -LiteralPath $extensions)) { throw '找不到 VS Code 扩展目录。请先安装 Remote - SSH 和 Codex 扩展。' }
-        $previousPort = [int]$config.ProxyPort
         if ($GuiMode) { Test-ProxyPort ([int]$config.ProxyPort) }
         else { $config.ProxyPort = Resolve-ProxyPort $config }
         Write-JsonFile $script:ConfigFile $config
-        if ([int]$config.ProxyPort -ne $previousPort) {
-            Write-Host ('代理端口已从 {0} 更新为 {1}，隧道和专用窗口将一起使用新端口。' -f $previousPort,$config.ProxyPort) -ForegroundColor Green
-        }
-        Write-Host ('当前服务器：' + $config.SshHost)
+        $sshExe = Get-SshExe
         $sshCopy = Join-Path $script:RuntimeRoot 'ssh-config'
         Write-IsolatedSshConfig $sshCopy
         $effective = & $sshExe -G -F $sshCopy $config.SshHost 2>$null
-        if ($LASTEXITCODE -ne 0) { throw 'SSH 配置检查失败，请检查 SSH Host 名称及配置文件。' }
-        if ($effective -match '^(remoteforward|localforward|dynamicforward)\s') {
-            throw 'SSH 的 Include 文件仍包含端口转发。请先为该连接移除常驻转发；原配置未被本工具修改。'
-        }
-        $userData = Join-Path $script:RuntimeRoot 'vscode-data'
-        $settingsFile = Join-Path $userData 'User\settings.json'
+        if ($LASTEXITCODE -ne 0) { throw 'SSH 配置检查失败。' }
+        if ($effective -match '^(remoteforward|localforward|dynamicforward)\s') { throw 'SSH Include 文件仍有常驻端口转发，请先处理重复转发。' }
         $log = Join-Path $script:RuntimeRoot 'connection.log'
         $errorLog = Join-Path $script:RuntimeRoot 'ssh-error.log'
-        $forward = '127.0.0.1:{0}:127.0.0.1:{0}' -f $config.ProxyPort
         $sessionId = [Guid]::NewGuid().ToString('N')
-        $sshArguments = @('-n', '-T', '-F', $sshCopy, '-o', 'ExitOnForwardFailure=yes', '-o', 'ServerAliveInterval=15', '-o', 'ServerAliveCountMax=2', '-o', 'ConnectTimeout=15', '-R', $forward, $config.SshHost, (Get-RemoteCommand $config.ProxyPort $sessionId))
-        Write-Host '正在建立连接。如提示密码或首次确认主机，请在此窗口完成。' -ForegroundColor Cyan
-        $interactiveFallback = $false
-        if ($GuiMode) {
-            $hiddenArgs = @('-o', 'BatchMode=yes') + $sshArguments
-            $ssh = Start-Process -FilePath $sshExe -ArgumentList (($hiddenArgs | ForEach-Object { Quote-NativeArgument $_ }) -join ' ') -WindowStyle Hidden -RedirectStandardOutput $log -RedirectStandardError $errorLog -PassThru
-        } else {
-            $ssh = Start-Process -FilePath $sshExe -ArgumentList (($sshArguments | ForEach-Object { Quote-NativeArgument $_ }) -join ' ') -NoNewWindow -RedirectStandardOutput $log -PassThru
-        }
-        Write-JsonFile $stateFile @{
-            SshPid = $ssh.Id
-            SshExe = $sshExe
-            SshStartedUtcTicks = $ssh.StartTime.ToUniversalTime().Ticks.ToString()
-        }
+        $forward = '127.0.0.1:{0}:127.0.0.1:{0}' -f $config.ProxyPort
+        $arguments = @('-T','-F',$sshCopy,'-o','ExitOnForwardFailure=yes','-o','ServerAliveInterval=15','-o','ServerAliveCountMax=2','-o','ConnectTimeout=15','-R',$forward,$config.SshHost,(Get-RemoteCommand $config.ProxyPort $sessionId))
+        if ($GuiMode) { $arguments = @('-o','BatchMode=yes') + $arguments }
+        Write-Host ('正在为 ' + $config.SshHost + ' 开启共享连接……') -ForegroundColor Cyan
+        $channel = Start-SshChannel $sshExe $arguments $log $errorLog -Batch:$GuiMode
+        $ssh = $channel.Process
+        Write-JsonFile $stateFile @{ SshPid=$ssh.Id; SshExe=$sshExe; SshStartedUtcTicks=$ssh.StartTime.ToUniversalTime().Ticks.ToString(); SshHost=$config.SshHost; SessionId=$sessionId }
         $ownsState = $true
         $deadline = [DateTime]::UtcNow.AddMinutes(3)
         $received = ''
         while ([DateTime]::UtcNow -lt $deadline) {
-            if (Test-Path -LiteralPath $stopFile) { Write-Host '已取消连接。'; return }
+            if (Test-Path -LiteralPath $stopFile) { return }
+            Send-SshHeartbeat $channel
             if ($ssh.HasExited) {
-                $details = ''
-                if ($GuiMode -and (Test-Path -LiteralPath $errorLog)) { $details = Read-SharedText $errorLog }
-                if ($GuiMode -and -not $interactiveFallback -and $details -match '(?i)(permission denied|host key verification failed|sign_and_send_pubkey|authentication failed)') {
-                    Write-Host '需要完成 SSH 登录，请在弹出的登录窗口输入密码或确认主机。'
-                    $interactiveFallback = $true
-                    $ssh = Start-Process -FilePath $sshExe -ArgumentList (($sshArguments | ForEach-Object { Quote-NativeArgument $_ }) -join ' ') -WindowStyle Normal -RedirectStandardOutput $log -PassThru
-                    Write-JsonFile $stateFile @{ SshPid=$ssh.Id; SshExe=$sshExe; SshStartedUtcTicks=$ssh.StartTime.ToUniversalTime().Ticks.ToString() }
-                    $deadline = [DateTime]::UtcNow.AddMinutes(3)
-                    Start-Sleep -Milliseconds 250
-                    continue
+                try { $channel.Copy.Wait(1000) | Out-Null; if($channel.ErrorCopy){$channel.ErrorCopy.Wait(1000) | Out-Null} } catch { }
+                $details = if($GuiMode) { Read-SharedText $errorLog } else { '' }
+                if ($GuiMode -and $details -match '(?i)(permission denied|host key verification failed|sign_and_send_pubkey|authentication failed)') {
+                    Close-SshChannel $channel
+                    $channel=$null
+                    Remove-Item -LiteralPath $stateFile -Force
+                    $ownsState=$false
+                    $lock.Dispose(); $lock=$null
+                    Write-Host '请在弹出的 SSH 窗口输入密码或确认主机。'
+                    $shell=Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+                    $childArgs=@('-NoLogo','-NoProfile','-ExecutionPolicy','Bypass','-File',(Join-Path $script:PackageRoot 'RemoteCodex.ps1'),'-Action','Start')
+                    $child=Start-Process -FilePath $shell -ArgumentList (($childArgs|ForEach-Object{Quote-NativeArgument $_}) -join ' ') -WindowStyle Normal -PassThru
+                    $child.WaitForExit()
+                    if($child.ExitCode -ne 0){throw 'SSH 登录窗口中的共享连接未完成。'}
+                    return
                 }
-                if ($details) { throw ('SSH 连接失败：' + $details.Trim()) }
-                throw 'SSH 连接已退出。请查看登录窗口；可能是登录失败，或服务器上的代理转发端口已占用。'
+                throw ('共享连接未完成。请确认服务器有 Python 3、curl，端口未占用。' + $details.Trim())
             }
-            if (Test-Path -LiteralPath $log) { $received = Read-SharedText $log }
+            if (Test-Path -LiteralPath $log) { $received=Read-SharedText $log }
             if ($received.Contains('CODEX_SWITCH_READY')) { break }
             Start-Sleep -Milliseconds 250
         }
-        if (-not $received.Contains('CODEX_SWITCH_READY')) { throw '等待 SSH 登录超时，请重新启动。' }
-        if ($received -notmatch 'CODEX_SWITCH_HOME=([A-Za-z0-9+/=]+)') { throw '无法读取远程主目录。' }
-        $remoteHome = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($Matches[1]))
-        if ($received -notmatch 'CODEX_SWITCH_WRAPPER=([A-Za-z0-9+/=]+)') { throw '无法准备远端 Codex 代理启动器，请重新连接。' }
-        $remoteWrapper = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($Matches[1]))
-        if (-not $remoteWrapper.StartsWith($remoteHome + '/.cache/remote-codex-switch/') -or -not $remoteWrapper.EndsWith('/codex')) {
-            throw '远端 Codex 启动器路径无效。'
+        if (-not $received.Contains('CODEX_SWITCH_READY') -or -not $received.Contains('CODEX_SWITCH_SHARED=1')) { throw '等待共享连接超时。' }
+        Write-Host '共享连接已开启。请在该服务器当前用户的 VS Code 窗口重新加载一次，再使用 Codex。' -ForegroundColor Green
+        Write-Host '无需保留某个 VS Code 窗口。应用可收进托盘；关闭连接或退出应用时恢复远端代理设置。'
+        while (-not $ssh.HasExited -and -not (Test-Path -LiteralPath $stopFile)) {
+            Send-SshHeartbeat $channel
+            Start-Sleep -Milliseconds 500
         }
-        if ($received -match 'CODEX_SWITCH_AUTH_HTTP=([^\r\n]+)') {
-            $authStatus = $Matches[1]
-            if ($authStatus -eq '200') { Write-Host '已验证：服务器可通过该隧道连接 OpenAI 登录服务。' -ForegroundColor Green }
-            elseif ($authStatus -eq 'unavailable') { Write-Warning '服务器没有 curl，尚未验证 OpenAI 登录服务是否可达。' }
-            else { throw ('代理链路检查未通过：OpenAI 登录服务 HTTP ' + $authStatus + '。000 通常表示连接失败；403 需要查看节点或服务返回的具体错误。') }
-        }
-        Write-JsonFile $settingsFile (New-CodeSettings $config $sshCopy $remoteWrapper)
-        if ($received.Contains('CODEX_SWITCH_OLD_PROXY=1') -or $received.Contains('CODEX_SWITCH_OLD_SETTINGS=1')) {
-            Write-Warning '检测到服务器可能留有旧代理设置。本开关不会清理它们，普通终端可能仍受影响。请查看“README.md”的旧配置部分。'
-        }
-        # A fresh workspace identity prevents VS Code from reusing a disconnected
-        # window whose Codex process still holds an older proxy environment.
-        $workspace = Join-Path $script:RuntimeRoot ('Remote-Codex-' + [Guid]::NewGuid().ToString('N') + '.code-workspace')
-        Write-JsonFile $workspace (New-Workspace $config $remoteHome)
-        $code = Start-CodeClient $install $workspace $userData $extensions
-        Write-Host ''
-        Write-Host '远端 Codex 代理启动器已准备，正在打开 VS Code 专用窗口。' -ForegroundColor Green
-        Write-Host '用完关闭该 VS Code 窗口，隧道会自动停止；也可双击“关闭远程Codex.cmd”。'
-        Write-Host '此窗口请保持打开。首次使用可能需要在远端安装 Codex 扩展并登录。'
-        while (-not $code.HasExited -and -not $ssh.HasExited -and -not (Test-Path -LiteralPath $stopFile)) { Start-Sleep -Milliseconds 500 }
-        if (Test-Path -LiteralPath $stopFile) {
-            Write-Host '连接已按请求关闭。'
-        } elseif ($ssh.HasExited -and -not $code.HasExited) {
-            Write-Warning '代理隧道已停止或断开。服务器继续运行，专用窗口中的 Codex 将无法通过该隧道联网。'
-        } elseif ($code.HasExited -and $code.ExitCode -ne 0) {
-            throw ('VS Code 启动失败，退出码：' + $code.ExitCode)
-        }
+        if (-not (Test-Path -LiteralPath $stopFile)) { throw '共享连接已断开，请检查本机代理或 SSH 后重新开启。' }
     } finally {
-        if ($ssh -and -not $ssh.HasExited) {
-            Stop-Process -Id $ssh.Id -ErrorAction SilentlyContinue
-            $ssh.WaitForExit(3000) | Out-Null
-        }
-        if ($code -and -not $code.HasExited) {
-            # This is the waiting CLI helper, not the editor or the user's other windows.
-            Stop-Process -Id $code.Id -ErrorAction SilentlyContinue
-            $code.WaitForExit(3000) | Out-Null
-        }
-        if ($settingsFile -and (Test-Path -LiteralPath $settingsFile)) {
-            $settings = Get-Content -LiteralPath $settingsFile -Raw -Encoding UTF8 | ConvertFrom-Json
-            $settings.'http.proxy' = ''
-            if ($settings.PSObject.Properties['chatgpt.cliExecutable']) { $settings.'chatgpt.cliExecutable' = $null }
-            Write-JsonFile $settingsFile $settings
-        }
+        Close-SshChannel $channel
         if ($lock) {
             if ($ownsState -and (Test-Path -LiteralPath $stateFile)) { Remove-Item -LiteralPath $stateFile -Force }
             $lock.Dispose()
@@ -664,6 +564,7 @@ try {
         'Server' { Set-Server }
         'Detect' { Detect-ProxyPort }
         'SyncLogin' { Sync-CodexLogin -GuiMode:$GuiMode }
+        'Open' { Open-RemoteProject }
     }
 } catch {
     Write-Host ("操作未完成：" + $_.Exception.Message) -ForegroundColor Red

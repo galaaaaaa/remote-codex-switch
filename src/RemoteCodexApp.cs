@@ -15,8 +15,8 @@ using System.Web.Script.Serialization;
 using System.Windows.Forms;
 
 [assembly: AssemblyTitle("Remote Codex Switch")]
-[assembly: AssemblyVersion("0.3.0.0")]
-[assembly: AssemblyFileVersion("0.3.0.0")]
+[assembly: AssemblyVersion("0.4.0.0")]
+[assembly: AssemblyFileVersion("0.4.0.0")]
 
 namespace RemoteCodexSwitch {
     public sealed class AppConfig {
@@ -40,6 +40,7 @@ namespace RemoteCodexSwitch {
     public static class Program {
         public static readonly JavaScriptSerializer Json = new JavaScriptSerializer();
         public static readonly UTF8Encoding Utf8 = new UTF8Encoding(false);
+        public static EventWaitHandle ShowRequest;
         public static string DataRoot { get { return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "RemoteCodexSwitch"); } }
         public static string SshConfig { get { return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".ssh", "config"); } }
         public static string PowerShell { get { return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.System), "WindowsPowerShell", "v1.0", "powershell.exe"); } }
@@ -62,7 +63,7 @@ namespace RemoteCodexSwitch {
         }
         public static void InstallBackend() {
             Directory.CreateDirectory(DataRoot);
-            foreach (string name in new [] { "RemoteCodex.ps1", "GuiBridge.ps1" }) {
+            foreach (string name in new [] { "RemoteCodex.ps1", "GuiBridge.ps1", "RemoteSession.py" }) {
                 using (Stream input = Assembly.GetExecutingAssembly().GetManifestResourceStream(name)) {
                     if (input == null) throw new Exception("应用缺少内置组件，请重新下载完整版本。");
                     using (FileStream output = File.Create(Path.Combine(DataRoot, name))) input.CopyTo(output);
@@ -121,9 +122,11 @@ namespace RemoteCodexSwitch {
                 }
                 bool created;
                 using (var mutex = new Mutex(true, @"Local\RemoteCodexSwitch.Desktop", out created)) {
-                    if (!created) { MessageBox.Show("Remote Codex 已经打开，请使用现有窗口。", "Remote Codex"); return 0; }
-                    InstallBackend();
-                    Application.Run(new MainForm(false));
+                    using(ShowRequest=new EventWaitHandle(false,EventResetMode.AutoReset,@"Local\RemoteCodexSwitch.Show")) {
+                        if (!created) { ShowRequest.Set(); return 0; }
+                        InstallBackend();
+                        Application.Run(new MainForm(false));
+                    }
                 }
                 return 0;
             } catch (Exception error) {
@@ -137,24 +140,25 @@ namespace RemoteCodexSwitch {
         readonly Color ink = Color.FromArgb(25, 35, 54), muted = Color.FromArgb(105, 116, 135), blue = Color.FromArgb(38, 99, 235);
         readonly bool preview;
         ComboBox servers, ports; TextBox folder; CheckBox auto;
-        Button refresh, detect, start, stop, save, editSsh, syncLogin;
+        Button refresh, detect, start, stop, save, editSsh, syncLogin, openProject;
         Label badge, hint, footer; TextBox log;
         ProgressBar progress; System.Windows.Forms.Timer timer;
         Process controller; bool busy, closing, fillingPorts, needsPortChoice;
         DateTime detectedAt = DateTime.MinValue;
         int confirmedPort;
         string loadedHost = "";
+        NotifyIcon tray; bool allowExit, trayNoticeShown;
         string ConfigPath { get { return Path.Combine(Program.DataRoot, "config.json"); } }
         string Runtime { get { return Path.Combine(Program.DataRoot, "runtime"); } }
         public MainForm(bool preview) {
             this.preview = preview;
-            Text = "Remote Codex · 远程连接开关 · v0.3.0";
+            Text = "Remote Codex · 共享连接 · v0.4.0";
             ClientSize = new Size(920, 744); MinimumSize = Size; MaximumSize = Size;
             MaximizeBox = false; StartPosition = FormStartPosition.CenterScreen;
             BackColor = Color.FromArgb(245, 247, 251); ForeColor = ink;
             Font = new Font("Microsoft YaHei UI", 10F); AutoScaleMode = AutoScaleMode.None;
             AddLabel(this, "Remote Codex", 32, 24, 500, 42, 23F, ink, true);
-            AddLabel(this, "需要时开启，结束后关闭。", 34, 72, 620, 25, 10F, muted, false);
+            AddLabel(this, "开启一次，同一服务器的 VS Code 窗口共享使用。", 34, 72, 680, 25, 10F, muted, false);
             badge = AddLabel(this, "尚未开启", 750, 36, 138, 30, 10F, muted, true);
             badge.BackColor = Color.FromArgb(232, 237, 245); badge.TextAlign = ContentAlignment.MiddleCenter;
             Panel card = new Panel { Location=new Point(32, 120), Size=new Size(856, 284), BackColor=Color.White };
@@ -164,9 +168,10 @@ namespace RemoteCodexSwitch {
             card.Controls.Add(servers);
             refresh = MakeButton(card, "刷新列表", 672, 46, 160, 34, false);
             AddLabel(card, "远程项目目录", 24, 96, 500, 24, 10F, ink, true);
-            folder = new TextBox { Location=new Point(24, 124), Size=new Size(808, 31), BorderStyle=BorderStyle.FixedSingle, Font=Font };
+            folder = new TextBox { Location=new Point(24, 124), Size=new Size(626, 31), BorderStyle=BorderStyle.FixedSingle, Font=Font };
             card.Controls.Add(folder);
-            AddLabel(card, "留空时打开该服务器的主目录。", 24, 158, 700, 22, 9F, muted, false);
+            openProject = MakeButton(card,"打开 VS Code",672,122,160,34,false);
+            AddLabel(card, "可选。也可以直接使用自己已经打开的远程窗口。", 24, 158, 800, 22, 9F, muted, false);
             auto = new CheckBox { Location=new Point(24, 207), Size=new Size(204, 28), Text="开启时自动检测端口", Checked=true, Font=Font, UseVisualStyleBackColor=true };
             card.Controls.Add(auto);
             AddLabel(card, "HTTP / Mixed 代理端口", 240, 180, 330, 24, 9F, muted, false);
@@ -174,7 +179,7 @@ namespace RemoteCodexSwitch {
             card.Controls.Add(ports);
             detect = MakeButton(card, "自动检测", 584, 206, 248, 35, false);
             AddLabel(card, "支持自动识别，也可以直接输入端口号。", 24, 249, 800, 22, 9F, muted, false);
-            start = MakeButton(this, "开启远程 Codex", 32, 424, 224, 46, true);
+            start = MakeButton(this, "开启共享连接", 32, 424, 224, 46, true);
             stop = MakeButton(this, "关闭连接", 272, 424, 140, 46, false);
             syncLogin = MakeButton(this, "同步本机登录", 428, 424, 164, 46, false);
             save = MakeButton(this, "保存设置", 608, 424, 132, 46, false);
@@ -185,12 +190,19 @@ namespace RemoteCodexSwitch {
             AddLabel(this, "运行记录", 34, 542, 800, 24, 9F, muted, true);
             log = new TextBox { Location=new Point(32, 571), Size=new Size(856, 124), Multiline=true, ScrollBars=ScrollBars.Vertical, ReadOnly=true, BorderStyle=BorderStyle.None, BackColor=Color.White, Font=new Font("Microsoft YaHei UI", 9F), ForeColor=muted };
             Controls.Add(log);
-            footer = AddLabel(this, "只管理本应用建立的隧道；关闭连接后，服务器计算任务会继续运行。", 34, 709, 850, 22, 8.5F, muted, false);
+            footer = AddLabel(this, "关闭本窗口会收进托盘；关闭 VS Code 不断开。需停止时点击“关闭连接”或从托盘退出。", 34, 709, 850, 22, 8.5F, muted, false);
             refresh.Click += delegate { LoadServers(); };
             detect.Click += async delegate { await DetectAsync(true); };
             start.Click += async delegate { await StartAsync(); };
             stop.Click += async delegate { await StopAsync(); };
             syncLogin.Click += async delegate { await SyncLoginAsync(); };
+            openProject.Click += async delegate {
+                try {
+                    SaveConfig(ReadControls());
+                    RunResult result=await Program.RunBackend("RemoteCodex.ps1","-Action Open");
+                    AppendLog(result.Output); if(result.ExitCode!=0) throw new Exception("未能打开 VS Code，请查看运行记录。");
+                } catch(Exception ex) { ShowError(ex.Message); }
+            };
             save.Click += delegate { try { SaveConfig(ReadControls()); AppendLog("设置已保存。"); } catch (Exception ex) { ShowError(ex.Message); } };
             editSsh.Click += delegate {
                 try { Directory.CreateDirectory(Path.GetDirectoryName(Program.SshConfig)); if (!File.Exists(Program.SshConfig)) File.WriteAllText(Program.SshConfig, "", Program.Utf8); Process.Start("notepad.exe", Program.Quote(Program.SshConfig)); }
@@ -205,14 +217,21 @@ namespace RemoteCodexSwitch {
                 servers.Items.AddRange(new object[] { "my-server", "training-server" }); servers.SelectedIndex=0;
                 folder.Text="/home/user/project"; ports.Text="7890";
                 AppendLog("已加载 2 台服务器，可在上方切换。");
-                AppendLog("检测端口后，点击开启即可打开 VS Code 专用窗口。");
+                AppendLog("开启后重新加载已有远程窗口；不需要保留某个 VS Code 窗口。");
             } else {
                 LoadServers(); LoadConfig();
                 AppendLog("应用已就绪。个人设置保存在本机，不会上传。");
+                var menu=new ContextMenuStrip();
+                menu.Items.Add("打开面板",null,delegate { ShowFromTray(); });
+                menu.Items.Add("关闭连接",null,async delegate { await StopAsync(); });
+                menu.Items.Add("退出并关闭连接",null,delegate { allowExit=true; Close(); });
+                tray=new NotifyIcon { Icon=SystemIcons.Application, Text="Remote Codex · 尚未连接", Visible=true, ContextMenuStrip=menu };
+                tray.DoubleClick += delegate { ShowFromTray(); };
+                Resize += delegate { if(WindowState==FormWindowState.Minimized) HideToTray(); };
             }
             UpdateControls();
             timer = new System.Windows.Forms.Timer { Interval=600 };
-            timer.Tick += delegate { PollSession(); };
+            timer.Tick += delegate { if(Program.ShowRequest!=null && Program.ShowRequest.WaitOne(0)) ShowFromTray(); PollSession(); };
             if (!preview) timer.Start();
         }
         Label AddLabel(Control parent, string text, int x, int y, int w, int h, float size, Color color, bool bold) {
@@ -237,6 +256,7 @@ namespace RemoteCodexSwitch {
             bool idle = !busy && !Running;
             foreach (Control c in new Control[] { servers,ports,folder,auto,refresh,detect,save,start,editSsh }) c.Enabled=idle;
             syncLogin.Enabled=!busy;
+            openProject.Enabled=!busy; folder.Enabled=!busy;
             stop.Enabled=Running && !busy; progress.Visible=busy;
         }
         void LoadServers() {
@@ -320,7 +340,8 @@ namespace RemoteCodexSwitch {
                 AppendLog(result.Output); if(result.ExitCode!=0) throw new Exception(result.Error);
                 if (controller != null) await Task.Run(delegate { controller.WaitForExit(5000); });
                 if(Running) { controller.Kill(); await Program.RunBackend("RemoteCodex.ps1","-Action Stop"); }
-                hint.Text="连接已关闭。服务器计算任务继续运行。";
+                hint.Text="共享连接已关闭，远端代理设置已请求恢复。服务器计算任务继续运行。";
+                if(tray!=null) tray.Text="Remote Codex · 尚未连接";
                 SetBadge("尚未开启",Color.FromArgb(232,237,245),muted);
             } catch (Exception ex) { ShowError(ex.Message); }
             finally { if(controller!=null && !Running) { controller.Dispose(); controller=null; } busy=false; UpdateControls(); }
@@ -361,17 +382,28 @@ namespace RemoteCodexSwitch {
                         if(!reader.ReadToEnd().Contains("CODEX_SWITCH_READY")) return;
                     }
                 }
-                SetBadge("SSH 已连接",Color.FromArgb(224,244,234),Color.FromArgb(24,119,77));
-                hint.Text="SSH 已连接。代理检查结果请看运行记录；账号登录需在 Codex 面板确认。";
+                SetBadge("共享已开启",Color.FromArgb(224,244,234),Color.FromArgb(24,119,77));
+                hint.Text="该服务器的远程窗口重新加载后可用；关闭编辑窗口不会断开。账号登录请在面板确认。";
+                if(tray!=null) tray.Text="Remote Codex · 共享连接已开启";
             } catch { }
         }
         void OnClosing(object sender,FormClosingEventArgs e) {
+            if(!preview && !allowExit && e.CloseReason!=CloseReason.WindowsShutDown && e.CloseReason!=CloseReason.ApplicationExitCall) { e.Cancel=true; HideToTray(); return; }
             closing=true; timer.Stop();
+            if(tray!=null) { tray.Visible=false; tray.Dispose(); }
             if (preview || !Running) return;
             try {
                 Program.RunBackend("RemoteCodex.ps1","-Action Stop").Wait(5000);
                 if(!controller.WaitForExit(3000)) { controller.Kill(); Program.RunBackend("RemoteCodex.ps1","-Action Stop").Wait(5000); }
             } catch { }
+        }
+        void ShowFromTray() { Show(); WindowState=FormWindowState.Normal; Activate(); }
+        void HideToTray() {
+            Hide();
+            if(tray!=null && !trayNoticeShown) {
+                trayNoticeShown=true;
+                tray.ShowBalloonTip(3000,"Remote Codex 在后台运行","连接会继续保持。双击托盘图标或桌面程序可打开面板；从托盘菜单退出可停止连接。",ToolTipIcon.Info);
+            }
         }
         public void VerifyUiState() {
             if(!start.Enabled || stop.Enabled) throw new Exception("Initial button state is incorrect.");
